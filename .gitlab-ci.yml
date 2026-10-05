@@ -1,0 +1,592 @@
+# Triggered only two ways, both deliberate: manually via GitLab -> CI/CD ->
+# Pipelines -> "Run pipeline" (CI_PIPELINE_SOURCE == "web", same pattern as
+# expenseapp's deploy job), or by server/main.go's own POST to
+# /projects/:id/pipeline (CI_PIPELINE_SOURCE == "api" -- a DIFFERENT value
+# from "web", easy to assume they're the same and leave "api" un-allowed by
+# mistake). Never on a plain push/MR.
+#
+# The `spec:inputs` block below (must come before the `---` separator) is
+# what actually makes fields show up on the "Run pipeline" page -- a plain
+# job-level `variables:` block (what this file used before) does NOT do
+# that, which is why the first version of this pipeline showed no fields
+# at all. `team` deliberately has no `options:` list even though GitLab
+# supports turning a string input into a single-select dropdown -- doing
+# that would make it impossible to type a genuinely NEW team's first
+# service, which is a real scenario this tool has to support.
+#
+# Required CI/CD variables (Settings -> CI/CD -> Variables, masked):
+#   IDP_CLI_PUSH_TOKEN -- api-scoped, belongs to a group-level Developer
+#                       service account (demo-org). Used in FIVE
+#                       places: generate (read-only clone of
+#                       observability-dashboards, to fetch the dashboard
+#                       Jsonnet template -- only when dashboard=true),
+#                       publish-service-mr (push a branch into TARGET_REPO, open an
+#                       MR), publish-dashboard-mr (same, against
+#                       observability-dashboards), publish-appset-mr
+#                       (same, against gitops), and publish-terraform-mr
+#                       (same, against terraform-modules -- only when
+#                       ecr_repo_exists=false). One group-scoped token
+#                       covers all five since every repo involved lives
+#                       under demo-org, no second credential needed.
+#                       (GITLAB_TOKEN used to also be required here, for a
+#                       live dashboard-ownership check -- removed along with
+#                       that check when dashboards moved to per-service,
+#                       like --has-hpa; see dashboard.go.)
+#
+# target_repo is optional: leave it empty to just download generated files
+# as a CI artifact (the original behavior); set it to open real MRs
+# instead -- against TARGET_REPO itself (values.yaml/CI), against
+# observability-dashboards when dashboard=true, and against gitops (an
+# ApplicationSet entry) every time TARGET_REPO is set. None of these are a
+# manual paste-by-hand step anymore: gitops/applicationsets/expense-teams.yaml
+# used to be a hand-maintained List a script once corrupted by string-patching
+# it (see CLAUDE.md) -- now every new service is its own new file under
+# gitops/services/, which that same corruption risk doesn't apply to (a new
+# file can't corrupt an existing one).
+#
+# target_repo must already exist (even just a README) -- this tool has
+# never assumed it creates the service's own repo, only wires config into
+# one that's already there.
+spec:
+  inputs:
+    name:
+      type: string
+      description: "Service name, e.g. team-payments-backend"
+    team:
+      type: string
+      description: "Team/namespace this service belongs to, e.g. team-analytics (free text -- also used for a brand-new team's first service)"
+    port:
+      type: number
+      default: 8080
+      description: "Container port"
+    has_hpa:
+      type: boolean
+      default: true
+      description: "Generate HPA config in values.yaml"
+    replicas:
+      type: string
+      default: ""
+      description: "Replica count override -- leave empty for the tool's default (2 if has_hpa, else 1)"
+    dockerfile_path:
+      type: string
+      default: "Dockerfile"
+      description: "Path to the Dockerfile inside the service's own repo"
+    ecr_repo:
+      type: string
+      default: ""
+      description: "ECR repository name -- leave empty to default to the service name"
+    ecr_repo_exists:
+      type: boolean
+      default: false
+      description: "Set true if ecr_repo already exists (e.g. a second service in an already-wired multi-service repo) -- skips generating/opening the Terraform MR that would create it"
+    dashboard:
+      type: boolean
+      default: false
+      description: "Also generate a starter Grafana dashboard"
+    eks_cluster_name:
+      type: string
+      default: "demoapp-dev-expense-eks"
+      description: "EKS cluster name, for the deploy job's kubeconfig update"
+    target_repo:
+      type: string
+      default: ""
+      description: "Existing GitLab project path to open a Merge Request against, e.g. demo-org/analytics-backend -- leave empty to just download the generated files as a CI artifact"
+    target_path:
+      type: string
+      default: ""
+      description: "Subdirectory inside target_repo to write into, e.g. backend -- leave empty for the repo root. Note: a .gitlab-ci.yml written into a subdirectory is NOT auto-read by GitLab (it only reads one at repo root) -- fine for review, needs manual include/merge if this repo already has its own root .gitlab-ci.yml"
+---
+workflow:
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "web"'
+    - if: '$CI_PIPELINE_SOURCE == "api"'
+    - when: never
+
+stages:
+  - generate
+  - publish
+
+generate:
+  image: golang:1.27-alpine
+  stage: generate
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "web"'
+    - if: '$CI_PIPELINE_SOURCE == "api"'
+  variables:
+    # Bound to job variables (not spliced straight into `script:`) so the
+    # shell handles them as normal, safely-quoted env vars -- inputs get
+    # interpolated into the YAML as raw text at compile time, so passing
+    # them through a variable here instead of inline in script: avoids a
+    # crafted input value corrupting the generated shell command.
+    NAME: $[[ inputs.name ]]
+    TEAM: $[[ inputs.team ]]
+    PORT: $[[ inputs.port ]]
+    HAS_HPA: $[[ inputs.has_hpa ]]
+    REPLICAS: $[[ inputs.replicas ]]
+    DOCKERFILE_PATH: $[[ inputs.dockerfile_path ]]
+    ECR_REPO: $[[ inputs.ecr_repo ]]
+    ECR_REPO_EXISTS: $[[ inputs.ecr_repo_exists ]]
+    DASHBOARD: $[[ inputs.dashboard ]]
+    EKS_CLUSTER_NAME: $[[ inputs.eks_cluster_name ]]
+    TARGET_REPO: $[[ inputs.target_repo ]]
+  before_script:
+    - |
+      if [ -z "$NAME" ] || [ -z "$TEAM" ]; then
+        echo "Set name and team as pipeline inputs and try again." >&2
+        exit 1
+      fi
+      if [ "$DASHBOARD" = "true" ]; then
+        if [ -z "$IDP_CLI_PUSH_TOKEN" ]; then
+          echo "dashboard=true needs IDP_CLI_PUSH_TOKEN (to clone observability-dashboards for the template)." >&2
+          exit 1
+        fi
+        # Only needed when a dashboard is actually being generated -- this
+        # image has no git by default.
+        apk add --no-cache git
+      fi
+  script:
+    - |
+      # The dashboard Jsonnet template is fetched fresh here every run, not
+      # vendored/embedded in this repo -- observability-dashboards' own
+      # templates/standard-microservice-template.jsonnet is the ONLY copy
+      # that exists anywhere (see dashboard.go). A shallow, unauthenticated-
+      # read-not-needed clone is enough since IDP_CLI_PUSH_TOKEN already has
+      # read access to every repo in this group; no separate token.
+      if [ "$DASHBOARD" = "true" ]; then
+        git clone --depth 1 "https://oauth2:${IDP_CLI_PUSH_TOKEN}@gitlab.com/demo-org/observability-dashboards.git" obs-dash-repo
+      fi
+      ARGS="--name=$NAME --team=$TEAM --port=$PORT --has-hpa=$HAS_HPA --dockerfile-path=$DOCKERFILE_PATH --dashboard=$DASHBOARD --eks-cluster-name=$EKS_CLUSTER_NAME --ecr-repo-exists=$ECR_REPO_EXISTS"
+      if [ -n "$ECR_REPO" ]; then ARGS="$ARGS --ecr-repo=$ECR_REPO"; fi
+      if [ -n "$REPLICAS" ]; then ARGS="$ARGS --replicas=$REPLICAS"; fi
+      # --repo-name matters for the ApplicationSet snippet (valuesRepoURL) --
+      # only differs from --name when target_repo isn't named after the
+      # service (e.g. onboarding into an existing multi-service repo).
+      if [ -n "$TARGET_REPO" ]; then
+        REPO_NAME=$(printf '%s' "$TARGET_REPO" | sed 's#.*/##')
+        ARGS="$ARGS --repo-name=$REPO_NAME"
+      fi
+      echo "Running: go run . $ARGS"
+      go run . $ARGS
+  artifacts:
+    paths:
+      - "$NAME/"
+    expire_in: 1 week
+
+publish-service-mr:
+  image: alpine:3.20
+  stage: publish
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "web"'
+    - if: '$CI_PIPELINE_SOURCE == "api"'
+  needs:
+    - job: generate
+  variables:
+    NAME: $[[ inputs.name ]]
+    TARGET_REPO: $[[ inputs.target_repo ]]
+    TARGET_PATH: $[[ inputs.target_path ]]
+    DASHBOARD: $[[ inputs.dashboard ]]
+  before_script:
+    - apk add --no-cache git curl jq
+    - |
+      if [ -n "$TARGET_REPO" ] && [ -z "$IDP_CLI_PUSH_TOKEN" ]; then
+        echo "Set CI/CD variable IDP_CLI_PUSH_TOKEN (api-scoped, group Developer service account)." >&2
+        exit 1
+      fi
+  # One single block, deliberately -- script: array items don't reliably
+  # short-circuit each other on `exit 0` (each may run as its own shell
+  # invocation), so every guard below has to sit inside ONE continuous
+  # shell script to actually skip what comes after it.
+  script:
+    - |
+      if [ -z "$TARGET_REPO" ]; then
+        echo "target_repo not set -- nothing to publish. Download the generate job's artifact instead."
+        exit 0
+      fi
+      git clone "https://oauth2:${IDP_CLI_PUSH_TOKEN}@gitlab.com/${TARGET_REPO}.git" target-repo
+      cd target-repo
+      DEFAULT_BRANCH=$(git remote show origin | sed -n '/HEAD branch/s/.*: //p')
+      DEST="."
+      if [ -n "$TARGET_PATH" ]; then
+        DEST="$TARGET_PATH"
+      fi
+      # Checked against DEFAULT_BRANCH specifically, never the working
+      # branch -- this answers "does this exact service already exist,
+      # independent of anything idp-cli itself has done" and stays a
+      # stable answer across re-runs (unlike checking the working tree,
+      # which would see our OWN prior output once the branch below exists).
+      VALUES_PATH="${DEST}/values-${NAME}.yaml"
+      if git show "${DEFAULT_BRANCH}:${VALUES_PATH}" >/dev/null 2>&1; then
+        echo "This service already exists on ${DEFAULT_BRANCH} (${VALUES_PATH})."
+        echo "It's already created -- edit that file directly instead of regenerating it."
+        exit 0
+      fi
+      # Fixed, not per-pipeline-run -- this is a scaffold for ONE service,
+      # so re-running with a tweaked input (a different port, say) should
+      # update the same MR via a new commit, exactly how MRs normally work
+      # -- not spawn a second one. git ls-remote needs no extra API scope
+      # beyond the push access already required.
+      BRANCH="idp/new-service-${NAME}"
+      if git ls-remote --exit-code --heads origin "$BRANCH" >/dev/null 2>&1; then
+        echo "Branch ${BRANCH} already exists -- updating it with the newly generated files."
+        git fetch origin "$BRANCH"
+        git checkout -B "$BRANCH" "origin/$BRANCH"
+      else
+        git checkout -b "$BRANCH"
+      fi
+      if [ -n "$TARGET_PATH" ]; then
+        mkdir -p "$DEST"
+      fi
+      # A branch reused via the checkout above (git checkout -B ... origin/$BRANCH)
+      # carries forward WHATEVER was on it before -- this repo's own history has a
+      # real example: a branch from before dashboards moved to the centralized
+      # observability-dashboards repo still had a dashboards/ file from the old
+      # design, and since nothing else here ever deletes files, it would have
+      # stayed forever, landing in main's tree the moment the MR got merged.
+      # dashboards/ has never had any other legitimate purpose inside a service's
+      # own repo, so it's always safe to clear here, unconditionally, whether or
+      # not this run is even generating one now.
+      rm -rf "${DEST}/dashboards"
+      # Always name-qualified (see ValuesFile in values.go), and always
+      # overwritten here -- the DEFAULT_BRANCH check above already ruled
+      # out "this is someone else's unrelated file"; anything at this path
+      # on our OWN branch is only ever idp-cli's own prior output.
+      cp "../${NAME}/values-${NAME}.yaml" "$VALUES_PATH"
+      # A generated dashboard does NOT get copied into this repo -- it's
+      # published straight into the observability-dashboards repo instead,
+      # by the separate publish-dashboard-mr job below.
+      # .gitlab-ci.yml can't coexist -- GitLab only ever reads ONE, at the
+      # repo root -- so this is never auto-merged. Checked against
+      # DEFAULT_BRANCH for the same reason as VALUES_PATH above. If it's
+      # there (another service's real jobs), leave it alone entirely; the
+      # generate job's ci-job-snippet.yaml artifact is what a human pastes
+      # in by hand. Same never-auto-patch principle as gitops's YAML.
+      CI_NOTE=""
+      if git show "${DEFAULT_BRANCH}:${DEST}/.gitlab-ci.yml" >/dev/null 2>&1; then
+        echo "${DEST}/.gitlab-ci.yml already exists on ${DEFAULT_BRANCH} -- not touching it."
+        CI_NOTE=" NOTE: ${DEST}/.gitlab-ci.yml already existed, so nothing was added there -- paste the two jobs from the generate job's ci-job-snippet.yaml artifact into it by hand."
+      else
+        cp "../${NAME}/.gitlab-ci.yml" "$DEST/.gitlab-ci.yml"
+      fi
+      git config user.email "idp-cli@gitlab-ci.local"
+      git config user.name "idp-cli"
+      git add -A
+      # Whether there's a new commit to push, and whether an MR needs to
+      # exist for this branch, are two SEPARATE questions -- deliberately
+      # not one exit-early check. Real case this caught: content unchanged
+      # since the last run, but the human had manually closed the MR in
+      # the meantime -- the old version exited here before ever trying to
+      # open a new one, leaving the branch orphaned with no MR at all.
+      if git diff --cached --quiet; then
+        echo "No changes to commit -- branch content already up to date."
+      else
+        git commit -m "idp-cli scaffold ${NAME}"
+        git push "https://oauth2:${IDP_CLI_PUSH_TOKEN}@gitlab.com/${TARGET_REPO}.git" "HEAD:${BRANCH}"
+      fi
+      PROJECT_ID=$(printf '%s' "$TARGET_REPO" | sed 's#/#%2F#g')
+      DESC=$(printf 'idp-cli scaffold for %s.%s\n\nAn ApplicationSet entry was also generated -- see the separate MR opened against gitops (publish-appset-mr job, same pipeline run). Merge both before expecting ArgoCD to pick this service up.' "$NAME" "$CI_NOTE")
+      if [ "$DASHBOARD" = "true" ]; then
+        DESC=$(printf '%s\n\nA starter dashboard was also generated -- see the separate MR opened against observability-dashboards (publish-dashboard-mr job, same pipeline run).' "$DESC")
+      fi
+      if [ -n "$CI_NOTE" ]; then
+        CI_JOB_SNIPPET=$(cat "../${NAME}/ci-job-snippet.yaml" 2>/dev/null || true)
+        DESC=$(printf '%s\n\n## Manual step: paste this into this repo'"'"'s existing .gitlab-ci.yml\n\n```yaml\n%s\n```' "$DESC" "$CI_JOB_SNIPPET")
+      fi
+      # A re-run just pushed a new commit to an already-open MR's branch --
+      # GitLab reflects that automatically, no separate "update the MR"
+      # call exists or is needed. This create call still runs every time
+      # regardless (simpler than tracking whether an MR already existed);
+      # GitLab refuses a second open MR for the same branch pair with 409,
+      # which is tolerated here as the expected/fine outcome, not an error.
+      HTTP_RESPONSE=$(curl --silent --show-error --write-out '\n%{http_code}' --request POST --header "PRIVATE-TOKEN: ${IDP_CLI_PUSH_TOKEN}" --data-urlencode "source_branch=${BRANCH}" --data-urlencode "target_branch=${DEFAULT_BRANCH}" --data-urlencode "title=Draft: idp-cli scaffold ${NAME}" --data-urlencode "description=${DESC}" "https://gitlab.com/api/v4/projects/${PROJECT_ID}/merge_requests")
+      HTTP_CODE=$(printf '%s' "$HTTP_RESPONSE" | tail -n 1)
+      HTTP_BODY=$(printf '%s' "$HTTP_RESPONSE" | sed '$d')
+      if [ "$HTTP_CODE" = "201" ]; then
+        echo "Opened MR for ${BRANCH}."
+      elif [ "$HTTP_CODE" = "409" ]; then
+        echo "MR already open for ${BRANCH} -- the commit just pushed updates it automatically, no new MR needed."
+      else
+        echo "Unexpected response creating the MR (HTTP ${HTTP_CODE}):" >&2
+        echo "$HTTP_BODY" >&2
+        exit 1
+      fi
+      # Fetched fresh via GET rather than parsed out of the create response
+      # above -- that response's shape differs between 201 (the new MR
+      # object) and 409 (no MR object at all), but there's exactly one open
+      # MR for this branch either way, so one lookup covers both outcomes.
+      # idp-cli's own server (/status) downloads this artifact to show the
+      # user a real link instead of making them dig through job logs.
+      mkdir -p ../mr-links
+      curl --silent --show-error --header "PRIVATE-TOKEN: ${IDP_CLI_PUSH_TOKEN}" "https://gitlab.com/api/v4/projects/${PROJECT_ID}/merge_requests?source_branch=${BRANCH}&state=opened" | jq -r '.[0].web_url // empty' > ../mr-links/service.txt
+      cat ../mr-links/service.txt
+  artifacts:
+    paths:
+      - "mr-links/"
+    expire_in: 1 week
+
+# Separate from publish-service-mr above on purpose: this opens a SECOND, independent
+# MR against a DIFFERENT repo (observability-dashboards, not TARGET_REPO) --
+# folding it into publish-service-mr would mean one job juggling two repos/two
+# branches/two MRs, and a failure in one half shouldn't block or partially
+# apply the other. OBS_DASH_REPO is hardcoded, not an input: it's a fixed
+# platform repo, same as the ApplicationSet in gitops that syncs it -- unlike
+# target_repo, there's nothing here that varies per service.
+publish-dashboard-mr:
+  image: alpine:3.20
+  stage: publish
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "web"'
+    - if: '$CI_PIPELINE_SOURCE == "api"'
+  needs:
+    - job: generate
+  variables:
+    NAME: $[[ inputs.name ]]
+    TEAM: $[[ inputs.team ]]
+    DASHBOARD: $[[ inputs.dashboard ]]
+  before_script:
+    - apk add --no-cache git curl jq
+    - |
+      if [ "$DASHBOARD" = "true" ] && [ -z "$IDP_CLI_PUSH_TOKEN" ]; then
+        echo "Set CI/CD variable IDP_CLI_PUSH_TOKEN (api-scoped, group Developer service account)." >&2
+        exit 1
+      fi
+  script:
+    - |
+      if [ "$DASHBOARD" != "true" ]; then
+        echo "dashboard not requested -- nothing to publish."
+        exit 0
+      fi
+      OBS_DASH_REPO="demo-org/observability-dashboards"
+      git clone "https://oauth2:${IDP_CLI_PUSH_TOKEN}@gitlab.com/${OBS_DASH_REPO}.git" obs-dash-repo
+      cd obs-dash-repo
+      DEFAULT_BRANCH=$(git remote show origin | sed -n '/HEAD branch/s/.*: //p')
+      DEST_PATH="teams/${TEAM}/${NAME}.yaml"
+      # Same pattern as publish-service-mr's VALUES_PATH check above: answers "does
+      # this exact dashboard already exist" against DEFAULT_BRANCH, not the
+      # working tree, so it stays a stable answer across re-runs.
+      if git show "${DEFAULT_BRANCH}:${DEST_PATH}" >/dev/null 2>&1; then
+        echo "Dashboard already exists on ${DEFAULT_BRANCH} (${DEST_PATH})."
+        echo "It's already created -- edit that file directly instead of regenerating it."
+        exit 0
+      fi
+      BRANCH="idp/new-dashboard-${NAME}"
+      if git ls-remote --exit-code --heads origin "$BRANCH" >/dev/null 2>&1; then
+        echo "Branch ${BRANCH} already exists -- updating it with the newly generated dashboard."
+        git fetch origin "$BRANCH"
+        git checkout -B "$BRANCH" "origin/$BRANCH"
+      else
+        git checkout -b "$BRANCH"
+      fi
+      mkdir -p "teams/${TEAM}"
+      cp "../${NAME}/dashboards/${NAME}-dashboard.yaml" "$DEST_PATH"
+      git config user.email "idp-cli@gitlab-ci.local"
+      git config user.name "idp-cli"
+      git add -A
+      if git diff --cached --quiet; then
+        echo "No changes to commit -- branch content already up to date."
+      else
+        git commit -m "idp-cli scaffold dashboard for ${NAME} (team ${TEAM})"
+        git push "https://oauth2:${IDP_CLI_PUSH_TOKEN}@gitlab.com/${OBS_DASH_REPO}.git" "HEAD:${BRANCH}"
+      fi
+      PROJECT_ID=$(printf '%s' "$OBS_DASH_REPO" | sed 's#/#%2F#g')
+      DESC=$(printf 'idp-cli scaffold dashboard for %s (team %s).\n\nGenerated by the same pipeline run that scaffolds this service'"'"'s values.yaml/CI -- see the linked service MR (publish-service-mr job) for that half.' "$NAME" "$TEAM")
+      HTTP_RESPONSE=$(curl --silent --show-error --write-out '\n%{http_code}' --request POST --header "PRIVATE-TOKEN: ${IDP_CLI_PUSH_TOKEN}" --data-urlencode "source_branch=${BRANCH}" --data-urlencode "target_branch=${DEFAULT_BRANCH}" --data-urlencode "title=Draft: idp-cli dashboard for ${NAME}" --data-urlencode "description=${DESC}" "https://gitlab.com/api/v4/projects/${PROJECT_ID}/merge_requests")
+      HTTP_CODE=$(printf '%s' "$HTTP_RESPONSE" | tail -n 1)
+      HTTP_BODY=$(printf '%s' "$HTTP_RESPONSE" | sed '$d')
+      if [ "$HTTP_CODE" = "201" ]; then
+        echo "Opened MR for ${BRANCH} in observability-dashboards."
+      elif [ "$HTTP_CODE" = "409" ]; then
+        echo "MR already open for ${BRANCH} -- the commit just pushed updates it automatically, no new MR needed."
+      else
+        echo "Unexpected response creating the MR (HTTP ${HTTP_CODE}):" >&2
+        echo "$HTTP_BODY" >&2
+        exit 1
+      fi
+      mkdir -p ../mr-links
+      curl --silent --show-error --header "PRIVATE-TOKEN: ${IDP_CLI_PUSH_TOKEN}" "https://gitlab.com/api/v4/projects/${PROJECT_ID}/merge_requests?source_branch=${BRANCH}&state=opened" | jq -r '.[0].web_url // empty' > ../mr-links/dashboard.txt
+      cat ../mr-links/dashboard.txt
+  artifacts:
+    paths:
+      - "mr-links/"
+    expire_in: 1 week
+
+# A THIRD MR, alongside publish-service-mr and publish-dashboard-mr: opens an MR
+# against gitops itself, adding services/<team>/<name>.yaml so
+# expense-teams.yaml's Git files generator (see that file, and
+# gitops/README.md) picks this service up with no manual paste step at all
+# -- the thing that used to be the one deliberately-manual step in this
+# whole pipeline, back when that file held a hand-maintained List a script
+# once corrupted (see CLAUDE.md). Runs every time TARGET_REPO is set,
+# unlike publish-dashboard-mr -- an ApplicationSet entry isn't optional the
+# way a dashboard is, every scaffolded service needs one to actually get
+# deployed by ArgoCD. Gated on TARGET_REPO for the same reason publish-service-mr
+# is: registering a service with ArgoCD before its own values.yaml MR even
+# exists would just be a guaranteed sync error for a repo path that isn't
+# there yet.
+publish-appset-mr:
+  image: alpine:3.20
+  stage: publish
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "web"'
+    - if: '$CI_PIPELINE_SOURCE == "api"'
+  needs:
+    - job: generate
+  variables:
+    NAME: $[[ inputs.name ]]
+    TEAM: $[[ inputs.team ]]
+    TARGET_REPO: $[[ inputs.target_repo ]]
+  before_script:
+    - apk add --no-cache git curl jq
+    - |
+      if [ -n "$TARGET_REPO" ] && [ -z "$IDP_CLI_PUSH_TOKEN" ]; then
+        echo "Set CI/CD variable IDP_CLI_PUSH_TOKEN (api-scoped, group Developer service account)." >&2
+        exit 1
+      fi
+  script:
+    - |
+      if [ -z "$TARGET_REPO" ]; then
+        echo "target_repo not set -- nothing to register with ArgoCD yet."
+        exit 0
+      fi
+      GITOPS_REPO="demo-org/gitops"
+      git clone "https://oauth2:${IDP_CLI_PUSH_TOKEN}@gitlab.com/${GITOPS_REPO}.git" gitops-repo
+      cd gitops-repo
+      DEFAULT_BRANCH=$(git remote show origin | sed -n '/HEAD branch/s/.*: //p')
+      DEST_PATH="services/${TEAM}/${NAME}.yaml"
+      # Same pattern as publish-service-mr's VALUES_PATH check: answers "does this
+      # exact entry already exist" against DEFAULT_BRANCH, not the working
+      # tree, so it stays a stable answer across re-runs.
+      if git show "${DEFAULT_BRANCH}:${DEST_PATH}" >/dev/null 2>&1; then
+        echo "ApplicationSet entry already exists on ${DEFAULT_BRANCH} (${DEST_PATH})."
+        echo "It's already registered -- edit that file directly instead of regenerating it."
+        exit 0
+      fi
+      BRANCH="idp/new-appset-entry-${NAME}"
+      if git ls-remote --exit-code --heads origin "$BRANCH" >/dev/null 2>&1; then
+        echo "Branch ${BRANCH} already exists -- updating it with the newly generated entry."
+        git fetch origin "$BRANCH"
+        git checkout -B "$BRANCH" "origin/$BRANCH"
+      else
+        git checkout -b "$BRANCH"
+      fi
+      mkdir -p "services/${TEAM}"
+      cp "../${NAME}/applicationset-entry.yaml" "$DEST_PATH"
+      git config user.email "idp-cli@gitlab-ci.local"
+      git config user.name "idp-cli"
+      git add -A
+      if git diff --cached --quiet; then
+        echo "No changes to commit -- branch content already up to date."
+      else
+        git commit -m "idp-cli register ApplicationSet entry for ${NAME} (team ${TEAM})"
+        git push "https://oauth2:${IDP_CLI_PUSH_TOKEN}@gitlab.com/${GITOPS_REPO}.git" "HEAD:${BRANCH}"
+      fi
+      PROJECT_ID=$(printf '%s' "$GITOPS_REPO" | sed 's#/#%2F#g')
+      DESC=$(printf 'idp-cli ApplicationSet entry for %s (team %s).\n\nGenerated by the same pipeline run that scaffolds this service'"'"'s values.yaml/CI -- see the linked service MR (publish-service-mr job) for that half. Once both MRs are merged, expense-teams.yaml'"'"'s Git files generator picks this service up automatically -- no manual paste step.' "$NAME" "$TEAM")
+      HTTP_RESPONSE=$(curl --silent --show-error --write-out '\n%{http_code}' --request POST --header "PRIVATE-TOKEN: ${IDP_CLI_PUSH_TOKEN}" --data-urlencode "source_branch=${BRANCH}" --data-urlencode "target_branch=${DEFAULT_BRANCH}" --data-urlencode "title=Draft: idp-cli ApplicationSet entry for ${NAME}" --data-urlencode "description=${DESC}" "https://gitlab.com/api/v4/projects/${PROJECT_ID}/merge_requests")
+      HTTP_CODE=$(printf '%s' "$HTTP_RESPONSE" | tail -n 1)
+      HTTP_BODY=$(printf '%s' "$HTTP_RESPONSE" | sed '$d')
+      if [ "$HTTP_CODE" = "201" ]; then
+        echo "Opened MR for ${BRANCH} in gitops."
+      elif [ "$HTTP_CODE" = "409" ]; then
+        echo "MR already open for ${BRANCH} -- the commit just pushed updates it automatically, no new MR needed."
+      else
+        echo "Unexpected response creating the MR (HTTP ${HTTP_CODE}):" >&2
+        echo "$HTTP_BODY" >&2
+        exit 1
+      fi
+      mkdir -p ../mr-links
+      curl --silent --show-error --header "PRIVATE-TOKEN: ${IDP_CLI_PUSH_TOKEN}" "https://gitlab.com/api/v4/projects/${PROJECT_ID}/merge_requests?source_branch=${BRANCH}&state=opened" | jq -r '.[0].web_url // empty' > ../mr-links/appset.txt
+      cat ../mr-links/appset.txt
+  artifacts:
+    paths:
+      - "mr-links/"
+    expire_in: 1 week
+
+# A FOURTH MR: opens an MR against terraform-modules, adding ecr/${NAME}.tf
+# (a new aws_ecr_repository resource + its output, scaffolded by terraform.go).
+# Real gap found and closed 2026-10-01: idp-cli generated values.yaml/CI for
+# a brand-new service but never provisioned the ECR repo those files assume
+# exists -- every previous test run only exercised file-generation mechanics
+# against repos that didn't need a real image pushed. This MR only wires the
+# repository into the ecr module itself; it deliberately does NOT bump the
+# module's semver tag or touch expenseinfra's account/ecr call site (that
+# stays a manual step, same as this project's own versioning convention --
+# plain `git tag`, bumped deliberately, no automation) -- the MR description
+# below spells out exactly what's left so it's a documented step, not a
+# silent gap.
+publish-terraform-mr:
+  image: alpine:3.20
+  stage: publish
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "web"'
+    - if: '$CI_PIPELINE_SOURCE == "api"'
+  needs:
+    - job: generate
+  variables:
+    NAME: $[[ inputs.name ]]
+    ECR_REPO: $[[ inputs.ecr_repo ]]
+    ECR_REPO_EXISTS: $[[ inputs.ecr_repo_exists ]]
+  before_script:
+    - apk add --no-cache git curl jq
+    - |
+      if [ "$ECR_REPO_EXISTS" != "true" ] && [ -z "$IDP_CLI_PUSH_TOKEN" ]; then
+        echo "Set CI/CD variable IDP_CLI_PUSH_TOKEN (api-scoped, group Developer service account)." >&2
+        exit 1
+      fi
+  script:
+    - |
+      if [ "$ECR_REPO_EXISTS" = "true" ]; then
+        echo "ecr_repo_exists=true -- nothing to provision."
+        exit 0
+      fi
+      TF_MODULES_REPO="demo-org/terraform-modules"
+      git clone "https://oauth2:${IDP_CLI_PUSH_TOKEN}@gitlab.com/${TF_MODULES_REPO}.git" tf-modules-repo
+      cd tf-modules-repo
+      DEFAULT_BRANCH=$(git remote show origin | sed -n '/HEAD branch/s/.*: //p')
+      DEST_PATH="ecr/${NAME}.tf"
+      # Same pattern as the other publish jobs' idempotency check: answers
+      # "does this exact repo already exist" against DEFAULT_BRANCH, not the
+      # working tree, so it stays a stable answer across re-runs.
+      if git show "${DEFAULT_BRANCH}:${DEST_PATH}" >/dev/null 2>&1; then
+        echo "ECR repository already provisioned on ${DEFAULT_BRANCH} (${DEST_PATH})."
+        echo "It's already created -- edit that file directly instead of regenerating it."
+        exit 0
+      fi
+      BRANCH="idp/new-ecr-repo-${NAME}"
+      if git ls-remote --exit-code --heads origin "$BRANCH" >/dev/null 2>&1; then
+        echo "Branch ${BRANCH} already exists -- updating it with the newly generated resource."
+        git fetch origin "$BRANCH"
+        git checkout -B "$BRANCH" "origin/$BRANCH"
+      else
+        git checkout -b "$BRANCH"
+      fi
+      cp "../${NAME}/terraform-ecr.tf" "$DEST_PATH"
+      git config user.email "idp-cli@gitlab-ci.local"
+      git config user.name "idp-cli"
+      git add -A
+      if git diff --cached --quiet; then
+        echo "No changes to commit -- branch content already up to date."
+      else
+        git commit -m "idp-cli: provision ECR repository for ${NAME}"
+        git push "https://oauth2:${IDP_CLI_PUSH_TOKEN}@gitlab.com/${TF_MODULES_REPO}.git" "HEAD:${BRANCH}"
+      fi
+      PROJECT_ID=$(printf '%s' "$TF_MODULES_REPO" | sed 's#/#%2F#g')
+      DESC=$(printf 'idp-cli: provision the %s ECR repository for %s.\n\nThis MR only adds the resource to the ecr module itself. Two manual steps remain before any CI pipeline for %s can actually push an image:\n\n1. After merging, bump this repo'"'"'s semver tag (e.g. `git tag vX.Y.0 \&\& git push --tags`) -- this project'"'"'s own versioning convention is a deliberate, manual `git tag`, never automated.\n2. In expenseinfra/terraform-live/account/ecr/main.tf: bump the ecr module'"'"'s `?ref=` to that new tag, add an `aws_ssm_parameter.%s_repository_url` publishing `module.ecr.%s_repository_url` (same shape as the existing backend/frontend ones), then `terraform apply` account/ecr for real.\n\nSee the linked service MR (publish-service-mr job, same pipeline run) for the app-code half.' "$ECR_REPO" "$NAME" "$NAME" "$NAME" "$NAME")
+      HTTP_RESPONSE=$(curl --silent --show-error --write-out '\n%{http_code}' --request POST --header "PRIVATE-TOKEN: ${IDP_CLI_PUSH_TOKEN}" --data-urlencode "source_branch=${BRANCH}" --data-urlencode "target_branch=${DEFAULT_BRANCH}" --data-urlencode "title=Draft: provision ECR repository for ${NAME}" --data-urlencode "description=${DESC}" "https://gitlab.com/api/v4/projects/${PROJECT_ID}/merge_requests")
+      HTTP_CODE=$(printf '%s' "$HTTP_RESPONSE" | tail -n 1)
+      HTTP_BODY=$(printf '%s' "$HTTP_RESPONSE" | sed '$d')
+      if [ "$HTTP_CODE" = "201" ]; then
+        echo "Opened MR for ${BRANCH} in terraform-modules."
+      elif [ "$HTTP_CODE" = "409" ]; then
+        echo "MR already open for ${BRANCH} -- the commit just pushed updates it automatically, no new MR needed."
+      else
+        echo "Unexpected response creating the MR (HTTP ${HTTP_CODE}):" >&2
+        echo "$HTTP_BODY" >&2
+        exit 1
+      fi
+      mkdir -p ../mr-links
+      curl --silent --show-error --header "PRIVATE-TOKEN: ${IDP_CLI_PUSH_TOKEN}" "https://gitlab.com/api/v4/projects/${PROJECT_ID}/merge_requests?source_branch=${BRANCH}&state=opened" | jq -r '.[0].web_url // empty' > ../mr-links/terraform.txt
+      cat ../mr-links/terraform.txt
+  artifacts:
+    paths:
+      - "mr-links/"
+    expire_in: 1 week

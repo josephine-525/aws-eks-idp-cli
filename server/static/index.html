@@ -1,0 +1,357 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>New Service</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&family=IBM+Plex+Mono:wght@500&display=swap" rel="stylesheet">
+<style>
+  body{margin:0;font-family:'Manrope',system-ui,sans-serif;-webkit-font-smoothing:antialiased;background:#F3F4F7;}
+  .field-input{transition:border-color .15s ease,box-shadow .15s ease;}
+  .field-input:focus{outline:none;border-color:#4F46E5;box-shadow:0 0 0 3px rgba(79,70,229,.14);}
+  .field-input::placeholder{color:#A6ABB4;}
+  .btn-primary{transition:background .15s ease,box-shadow .15s ease,transform .05s ease;}
+  .btn-primary:hover:not(:disabled){background:#4338CA;box-shadow:0 6px 16px rgba(79,70,229,.32);}
+  .btn-primary:active:not(:disabled){transform:translateY(1px);}
+  .btn-primary:disabled{opacity:.55;cursor:not-allowed;}
+  .switch-input{position:absolute;opacity:0;width:1px;height:1px;}
+  .switch-track{width:38px;height:22px;border-radius:999px;background:#D9DCE2;position:relative;flex-shrink:0;transition:background .15s ease;display:inline-block;}
+  .switch-thumb{position:absolute;top:2px;left:2px;width:18px;height:18px;border-radius:50%;background:#fff;box-shadow:0 1px 2px rgba(16,20,30,.18);transition:transform .15s ease;}
+  .switch-input:checked + .switch-track{background:#4F46E5;}
+  .switch-input:checked + .switch-track .switch-thumb{transform:translateX(16px);}
+  #result{font-size:13px;line-height:1.6;}
+  #result .run{border-radius:10px;padding:14px 16px;margin-bottom:10px;}
+  #result .run.ok{background:#F0FDF4;border:1px solid #BBF7D0;color:#166534;}
+  #result .run.err{background:#FEF2F2;border:1px solid #FECACA;color:#991B1B;}
+  #result .run a{color:inherit;font-weight:700;}
+</style>
+</head>
+<body>
+<div style="width:100%;min-height:100vh;box-sizing:border-box;display:flex;justify-content:center;padding:56px 24px 80px;">
+<div style="width:100%;max-width:720px;display:flex;flex-direction:column;gap:24px;">
+
+  <div style="display:flex;align-items:center;gap:8px;font-size:13px;color:#9297A1;font-weight:600;letter-spacing:.02em;">
+    <span>Platform</span><span style="color:#D4D7DC;">/</span><span>Services</span><span style="color:#D4D7DC;">/</span><span style="color:#4F46E5;">New</span>
+  </div>
+
+  <div style="display:flex;flex-direction:column;gap:10px;">
+    <div style="display:inline-flex;align-items:center;gap:6px;width:fit-content;padding:4px 10px 4px 8px;border-radius:999px;background:#EEF0FF;">
+      <svg width="12" height="12" viewBox="0 0 24 24" fill="none"><path d="M13 2 4 14h6l-1 8 9-12h-6l1-8Z" fill="#4F46E5"/></svg>
+      <span style="font-size:11px;font-weight:700;letter-spacing:.06em;color:#4F46E5;text-transform:uppercase;">Internal tooling</span>
+    </div>
+    <h1 style="margin:0;font-size:30px;line-height:1.2;font-weight:800;color:#111318;letter-spacing:-.01em;">New service</h1>
+    <p style="margin:0;font-size:14.5px;line-height:1.6;color:#6A6F79;max-width:560px;">
+      Triggers the <code style="font-family:'IBM Plex Mono',monospace;font-size:13px;background:#EDEEF1;padding:1px 5px;border-radius:4px;">idp-cli</code> pipeline for real. Leave <strong>Target repo</strong> empty to just generate a downloadable artifact; fill it in to open a Draft MR against an existing repo.
+    </p>
+  </div>
+
+  <div style="background:#FFFFFF;border:1px solid #E7E8EC;border-radius:16px;box-shadow:0 1px 2px rgba(16,20,30,.04),0 8px 24px rgba(16,20,30,.05);padding:24px 28px;display:flex;flex-direction:column;gap:14px;">
+    <div style="display:flex;flex-direction:column;gap:2px;">
+      <span style="font-size:13.5px;font-weight:700;color:#111318;">Describe it in plain language (optional)</span>
+      <span style="font-size:12.5px;color:#9297A1;">This only fills the form below — nothing runs until you review it and click Generate.</span>
+    </div>
+    <textarea id="chat-input" rows="2" placeholder="e.g. create a new service called payment-processor for team-analytics, port 9090, with autoscaling" class="field-input" style="padding:12px 13px;border:1px solid #D9DCE2;border-radius:9px;font-size:14px;background:#FCFCFD;font-family:inherit;resize:vertical;"></textarea>
+    <div style="display:flex;align-items:center;gap:10px;">
+      <button type="button" id="chat-btn" style="height:38px;padding:0 18px;border-radius:9px;background:#111318;border:none;color:#fff;font-size:13.5px;font-weight:700;font-family:inherit;cursor:pointer;">Fill form from description</button>
+      <span id="chat-status" style="font-size:12.5px;color:#9297A1;"></span>
+    </div>
+    <div id="chat-summary" style="display:none;font-size:13px;line-height:1.6;color:#3F4257;background:#F5F6FF;border:1px solid #E4E6FF;border-radius:10px;padding:12px 14px;"></div>
+  </div>
+
+  <form id="form" style="background:#FFFFFF;border:1px solid #E7E8EC;border-radius:16px;box-shadow:0 1px 2px rgba(16,20,30,.04),0 8px 24px rgba(16,20,30,.05);overflow:hidden;">
+    <div style="padding:36px 40px 8px;display:flex;flex-direction:column;gap:32px;">
+
+      <div style="display:flex;flex-direction:column;gap:18px;">
+        <span style="font-size:11.5px;font-weight:800;letter-spacing:.08em;text-transform:uppercase;color:#9297A1;">Service</span>
+        <div style="display:flex;flex-direction:column;gap:6px;">
+          <label for="name" style="font-size:13.5px;font-weight:700;color:#111318;">Service name</label>
+          <input id="name" name="name" type="text" required placeholder="team-payments-backend" class="field-input" style="height:42px;padding:0 13px;border:1px solid #D9DCE2;border-radius:9px;font-size:14px;background:#FCFCFD;font-family:inherit;">
+          <span style="font-size:12.5px;color:#9297A1;">Used as the output directory and ECR repo name by default.</span>
+        </div>
+        <div style="display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:18px;">
+          <div style="display:flex;flex-direction:column;gap:6px;">
+            <label for="team" style="font-size:13.5px;font-weight:700;color:#111318;">Team</label>
+            <input id="team" name="team" type="text" required placeholder="team-analytics" class="field-input" style="height:42px;padding:0 13px;border:1px solid #D9DCE2;border-radius:9px;font-size:14px;background:#FCFCFD;font-family:inherit;">
+            <span style="font-size:12.5px;color:#9297A1;">Free text — also for a brand-new team's first service.</span>
+          </div>
+          <div style="display:flex;flex-direction:column;gap:6px;">
+            <label for="port" style="font-size:13.5px;font-weight:700;color:#111318;">Container port</label>
+            <input id="port" name="port" type="number" value="8080" class="field-input" style="height:42px;padding:0 13px;border:1px solid #D9DCE2;border-radius:9px;font-size:14px;background:#FCFCFD;font-family:inherit;">
+          </div>
+        </div>
+      </div>
+
+      <div style="height:1px;background:#F0F1F4;"></div>
+
+      <div style="display:flex;flex-direction:column;gap:18px;">
+        <span style="font-size:11.5px;font-weight:800;letter-spacing:.08em;text-transform:uppercase;color:#9297A1;">Deployment</span>
+        <label style="display:flex;align-items:center;justify-content:space-between;gap:16px;cursor:pointer;">
+          <span style="display:flex;flex-direction:column;gap:2px;">
+            <span style="font-size:14px;font-weight:700;color:#111318;">Enable autoscaling (HPA)</span>
+            <span style="font-size:12.5px;color:#9297A1;">Sets replicaCount to 2 and adds an HPA block, 2–5 replicas at 70% CPU.</span>
+          </span>
+          <span style="position:relative;display:inline-flex;">
+            <input id="has_hpa" name="has_hpa" type="checkbox" checked class="switch-input">
+            <span class="switch-track"><span class="switch-thumb"></span></span>
+          </span>
+        </label>
+        <div style="display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:18px;">
+          <div style="display:flex;flex-direction:column;gap:6px;">
+            <label for="replicas" style="font-size:13.5px;font-weight:700;color:#111318;">Replica override</label>
+            <input id="replicas" name="replicas" type="text" placeholder="Leave empty for default" class="field-input" style="height:42px;padding:0 13px;border:1px solid #D9DCE2;border-radius:9px;font-size:14px;background:#FCFCFD;font-family:inherit;">
+          </div>
+          <div style="display:flex;flex-direction:column;gap:6px;">
+            <label for="dockerfile_path" style="font-size:13.5px;font-weight:700;color:#111318;">Dockerfile path</label>
+            <input id="dockerfile_path" name="dockerfile_path" type="text" value="Dockerfile" class="field-input" style="height:42px;padding:0 13px;border:1px solid #D9DCE2;border-radius:9px;font-size:14px;background:#FCFCFD;font-family:inherit;">
+          </div>
+        </div>
+        <div style="display:flex;flex-direction:column;gap:6px;">
+          <label for="ecr_repo" style="font-size:13.5px;font-weight:700;color:#111318;">ECR repository</label>
+          <input id="ecr_repo" name="ecr_repo" type="text" placeholder="Defaults to the service name" class="field-input" style="height:42px;padding:0 13px;border:1px solid #D9DCE2;border-radius:9px;font-size:14px;background:#FCFCFD;font-family:inherit;">
+        </div>
+        <label style="display:flex;align-items:center;justify-content:space-between;gap:16px;cursor:pointer;">
+          <span style="display:flex;flex-direction:column;gap:2px;">
+            <span style="font-size:14px;font-weight:700;color:#111318;">ECR repo already exists</span>
+            <span style="font-size:12.5px;color:#9297A1;">Skips opening the Terraform MR that would create it -- only check this for a second service reusing an existing repo.</span>
+          </span>
+          <span style="position:relative;display:inline-flex;">
+            <input id="ecr_repo_exists" name="ecr_repo_exists" type="checkbox" class="switch-input">
+            <span class="switch-track"><span class="switch-thumb"></span></span>
+          </span>
+        </label>
+      </div>
+
+      <div style="height:1px;background:#F0F1F4;"></div>
+
+      <div style="display:flex;flex-direction:column;gap:18px;">
+        <span style="font-size:11.5px;font-weight:800;letter-spacing:.08em;text-transform:uppercase;color:#9297A1;">Observability</span>
+        <label style="display:flex;align-items:center;justify-content:space-between;gap:16px;cursor:pointer;">
+          <span style="display:flex;flex-direction:column;gap:2px;">
+            <span style="font-size:14px;font-weight:700;color:#111318;">Generate dashboard</span>
+            <span style="font-size:12.5px;color:#9297A1;">Checks GitLab first; skipped automatically if the team already owns one.</span>
+          </span>
+          <span style="position:relative;display:inline-flex;">
+            <input id="dashboard" name="dashboard" type="checkbox" class="switch-input">
+            <span class="switch-track"><span class="switch-thumb"></span></span>
+          </span>
+        </label>
+        <div style="display:flex;flex-direction:column;gap:6px;">
+          <label for="eks_cluster_name" style="font-size:13.5px;font-weight:700;color:#111318;">EKS cluster name</label>
+          <input id="eks_cluster_name" name="eks_cluster_name" type="text" value="demoapp-dev-expense-eks" class="field-input" style="height:42px;padding:0 13px;border:1px solid #D9DCE2;border-radius:9px;font-size:14px;background:#FCFCFD;font-family:inherit;">
+        </div>
+      </div>
+
+      <div style="height:1px;background:#F0F1F4;"></div>
+
+      <div style="display:flex;flex-direction:column;gap:18px;">
+        <span style="font-size:11.5px;font-weight:800;letter-spacing:.08em;text-transform:uppercase;color:#9297A1;">Publish</span>
+        <div style="display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:18px;">
+          <div style="display:flex;flex-direction:column;gap:6px;">
+            <label for="target_repo" style="font-size:13.5px;font-weight:700;color:#111318;">Target repo</label>
+            <input id="target_repo" name="target_repo" type="text" placeholder="demo-org/analytics-demo" class="field-input" style="height:42px;padding:0 13px;border:1px solid #D9DCE2;border-radius:9px;font-size:14px;background:#FCFCFD;font-family:inherit;">
+          </div>
+          <div style="display:flex;flex-direction:column;gap:6px;">
+            <label for="target_path" style="font-size:13.5px;font-weight:700;color:#111318;">Target path</label>
+            <input id="target_path" name="target_path" type="text" placeholder="backend (optional)" class="field-input" style="height:42px;padding:0 13px;border:1px solid #D9DCE2;border-radius:9px;font-size:14px;background:#FCFCFD;font-family:inherit;">
+          </div>
+        </div>
+      </div>
+
+    </div>
+
+    <div id="result"></div>
+
+    <div style="display:flex;align-items:center;justify-content:flex-end;gap:10px;padding:24px 40px;background:#FAFAFB;border-top:1px solid #F0F1F4;">
+      <button type="submit" id="submit-btn" class="btn-primary" style="height:42px;padding:0 22px;border-radius:9px;background:#4F46E5;border:none;color:#fff;font-size:14px;font-weight:700;font-family:inherit;cursor:pointer;box-shadow:0 1px 2px rgba(79,70,229,.3);">Generate</button>
+    </div>
+  </form>
+
+  <p style="margin:0;font-size:12px;color:#AEB2BA;text-align:center;">Local only &middot; triggers a real GitLab pipeline run</p>
+
+</div>
+</div>
+
+<script>
+const form = document.getElementById('form');
+const resultEl = document.getElementById('result');
+const submitBtn = document.getElementById('submit-btn');
+const chatInput = document.getElementById('chat-input');
+const chatBtn = document.getElementById('chat-btn');
+const chatStatus = document.getElementById('chat-status');
+const chatSummary = document.getElementById('chat-summary');
+
+// /chat only fills the form below -- it never calls /generate itself.
+// Reviewing (and editing, if it got something wrong) the now-filled form,
+// then clicking the existing Generate button, IS the human-confirmation
+// step -- no separate "confirm" UI needed.
+chatBtn.addEventListener('click', async () => {
+  const message = chatInput.value.trim();
+  if (!message) return;
+
+  chatBtn.disabled = true;
+  chatStatus.textContent = 'Thinking…';
+  chatSummary.style.display = 'none';
+
+  try {
+    const resp = await fetch('/chat', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ message }),
+    });
+    const data = await resp.json();
+    if (!resp.ok) {
+      throw new Error(data.error || ('HTTP ' + resp.status));
+    }
+
+    const p = data.params;
+    form.name.value = p.name || '';
+    form.team.value = p.team || '';
+    form.port.value = p.port || 8080;
+    form.has_hpa.checked = !!p.has_hpa;
+    form.replicas.value = p.replicas || '';
+    form.dockerfile_path.value = p.dockerfile_path || 'Dockerfile';
+    form.ecr_repo.value = p.ecr_repo || '';
+    form.ecr_repo_exists.checked = !!p.ecr_repo_exists;
+    form.dashboard.checked = !!p.dashboard;
+    form.eks_cluster_name.value = p.eks_cluster_name || '';
+    form.target_repo.value = p.target_repo || '';
+    form.target_path.value = p.target_path || '';
+
+    chatSummary.style.display = 'block';
+    chatSummary.textContent = data.summary + ' — review the form below, then click Generate.';
+    chatStatus.textContent = '';
+  } catch (err) {
+    chatStatus.textContent = 'Failed: ' + err.message;
+  } finally {
+    chatBtn.disabled = false;
+  }
+});
+
+form.addEventListener('submit', async (e) => {
+  e.preventDefault();
+  submitBtn.disabled = true;
+  submitBtn.textContent = 'Generating…';
+
+  // A new panel per submit, prepended above any earlier ones -- NOT a
+  // shared element overwritten on every run. Clicking Generate again for a
+  // second service used to wipe the first run's MR links off the page
+  // before you'd had a chance to click them (real bug, found by testing);
+  // this keeps every run's result visible for the rest of the session.
+  const runEl = document.createElement('div');
+  runEl.className = 'run';
+  resultEl.prepend(runEl);
+
+  const payload = {
+    name: form.name.value.trim(),
+    team: form.team.value.trim(),
+    port: Number(form.port.value) || 8080,
+    has_hpa: form.has_hpa.checked,
+    replicas: form.replicas.value.trim(),
+    dockerfile_path: form.dockerfile_path.value.trim(),
+    ecr_repo: form.ecr_repo.value.trim(),
+    ecr_repo_exists: form.ecr_repo_exists.checked,
+    dashboard: form.dashboard.checked,
+    eks_cluster_name: form.eks_cluster_name.value.trim(),
+    target_repo: form.target_repo.value.trim(),
+    target_path: form.target_path.value.trim(),
+  };
+
+  try {
+    const resp = await fetch('/generate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    const data = await resp.json();
+    if (!resp.ok) {
+      throw new Error(data.error || ('HTTP ' + resp.status));
+    }
+    runEl.className = 'run ok';
+    runEl.innerHTML = 'Pipeline started: <a href="' + data.pipeline_url + '" target="_blank" rel="noopener">' + data.pipeline_url + '</a>';
+    // Poll /status instead of stopping here -- the point of this form is
+    // that the tool shows you what happened (the MR links it opened), not
+    // just a pipeline link you then have to go dig through job logs on.
+    submitBtn.textContent = 'Watching pipeline…';
+    await pollPipelineStatus(data.pipeline_id, data.pipeline_url, runEl);
+  } catch (err) {
+    runEl.className = 'run err';
+    runEl.textContent = 'Failed: ' + err.message;
+  } finally {
+    submitBtn.disabled = false;
+    submitBtn.textContent = 'Generate';
+  }
+});
+
+// Job name -> human label, and the mr_links key each job's entry (if any)
+// is keyed under -- see idp-cli's own .gitlab-ci.yml (publish-service-mr /
+// publish-dashboard-mr / publish-appset-mr / publish-terraform-mr) and
+// server/main.go (publishJobArtifacts) for where these names/keys come from.
+const JOB_LABELS = {
+  'generate': 'Generate files',
+  'publish-service-mr': 'Service repo MR',
+  'publish-dashboard-mr': 'Dashboard MR (observability-dashboards)',
+  'publish-appset-mr': 'ArgoCD registration MR (gitops)',
+  'publish-terraform-mr': 'ECR provisioning MR (terraform-modules)',
+};
+const MR_LINK_LABELS = {
+  service: 'Service repo MR',
+  dashboard: 'Dashboard MR (observability-dashboards)',
+  appset: 'ArgoCD registration MR (gitops)',
+  terraform: 'ECR provisioning MR (terraform-modules)',
+};
+const TERMINAL_PIPELINE_STATUSES = new Set(['success', 'failed', 'canceled', 'skipped']);
+
+async function pollPipelineStatus(pipelineId, pipelineUrl, runEl) {
+  // eslint-disable-next-line no-constant-condition
+  while (true) {
+    let data;
+    try {
+      const resp = await fetch('/status?pipeline_id=' + encodeURIComponent(pipelineId));
+      data = await resp.json();
+      if (!resp.ok) {
+        throw new Error(data.error || ('HTTP ' + resp.status));
+      }
+    } catch (err) {
+      runEl.className = 'run err';
+      runEl.textContent = 'Lost track of the pipeline (' + err.message + '). Check it directly: ' + pipelineUrl;
+      return;
+    }
+
+    renderPipelineStatus(data, pipelineUrl, runEl);
+
+    if (TERMINAL_PIPELINE_STATUSES.has(data.pipeline_status)) {
+      return;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 4000));
+  }
+}
+
+function renderPipelineStatus(data, pipelineUrl, runEl) {
+  let html = 'Pipeline <a href="' + pipelineUrl + '" target="_blank" rel="noopener">' + data.pipeline_status + '</a>';
+
+  const jobs = data.jobs || [];
+  if (jobs.length) {
+    html += '<ul style="margin:8px 0 0 0;padding-left:20px;">';
+    for (const job of jobs) {
+      html += '<li>' + (JOB_LABELS[job.name] || job.name) + ': ' + job.status + '</li>';
+    }
+    html += '</ul>';
+  }
+
+  const links = data.mr_links || {};
+  const linkKeys = Object.keys(links);
+  if (linkKeys.length) {
+    html += '<div style="margin-top:8px;">Merge requests opened:</div><ul style="margin:4px 0 0 0;padding-left:20px;">';
+    for (const key of linkKeys) {
+      html += '<li><a href="' + links[key] + '" target="_blank" rel="noopener">' + (MR_LINK_LABELS[key] || key) + '</a></li>';
+    }
+    html += '</ul>';
+  }
+
+  runEl.className = 'run ' + (data.pipeline_status === 'failed' ? 'err' : 'ok');
+  runEl.innerHTML = html;
+}
+</script>
+</body>
+</html>
